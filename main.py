@@ -434,7 +434,7 @@ def get_cid_from_microsoft(iid: str) -> str:
     }
 
     try:
-        resp = req.post(_MS_ENDPOINT, data=soap.encode("utf-8"), headers=headers, timeout=30)
+        resp = req.post(_MS_ENDPOINT, data=soap.encode("utf-8"), headers=headers, timeout=30, verify=False)
         if resp.status_code != 200:
             log.warning(f"  Microsoft API HTTP {resp.status_code}")
             return ""
