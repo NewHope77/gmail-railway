@@ -3,7 +3,7 @@
 Gmail Monitor for Railway — відстежує нові непрочитані листи,
 витягує ВСІ 63-значні коди активації MS Office і надсилає в Telegram.
 """
-import os, sys, re, json, base64, tempfile, time, warnings
+import os, sys, re, json, base64, tempfile, time, warnings, hmac, hashlib
 warnings.filterwarnings("ignore")
 
 import logging
@@ -381,6 +381,103 @@ def process_attachments(service, msg_id: str, payload: dict) -> list:
     return codes
 
 
+# ── Microsoft BatchActivation SOAP API ────────────────────────────────────────
+_MS_HMAC_KEY = bytes([
+    254, 49, 152, 117, 251, 72, 132, 134, 156, 243, 241, 206, 153, 168, 144, 100,
+    171, 87, 31, 202, 71, 4, 80, 88, 48, 36, 226, 20, 98, 135, 121, 160
+])
+_MS_DEFAULT_PID = "00000-00138-207-109016-00-1033-26100.0000-0922026"
+_MS_ENDPOINT = "https://activation.sls.microsoft.com/BatchActivation/BatchActivation.asmx"
+
+def get_cid_from_microsoft(iid: str) -> str:
+    """Отримує CID напряму від Microsoft BatchActivation SOAP API.
+    Повертає CID (рядок) або "" якщо не вдалось.
+    """
+    import xml.etree.ElementTree as ET
+    clean_iid = re.sub(r"\D", "", iid)
+    if len(clean_iid) not in (54, 63):
+        return ""
+
+    request_inner = (
+        f'<ActivationRequest xmlns="http://www.microsoft.com/DRM/SL/BatchActivationRequest/1.0">'
+        f'<VersionNumber>2.0</VersionNumber>'
+        f'<RequestType>1</RequestType>'
+        f'<Requests>'
+        f'<Request><PID>{_MS_DEFAULT_PID}</PID><IID>{clean_iid}</IID></Request>'
+        f'</Requests>'
+        f'</ActivationRequest>'
+    )
+
+    xml_bytes = request_inner.encode("utf-16-le")
+    digest = base64.b64encode(
+        hmac.new(_MS_HMAC_KEY, xml_bytes, hashlib.sha256).digest()
+    ).decode()
+    req64 = base64.b64encode(xml_bytes).decode()
+
+    soap = (
+        '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+        '<soap:Body>'
+        '<BatchActivate xmlns="http://www.microsoft.com/BatchActivationService">'
+        '<request>'
+        f'<Digest>{digest}</Digest>'
+        f'<RequestXml>{req64}</RequestXml>'
+        '</request>'
+        '</BatchActivate>'
+        '</soap:Body>'
+        '</soap:Envelope>'
+    )
+
+    headers = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "SOAPAction": "http://www.microsoft.com/BatchActivationService/BatchActivate",
+        "User-Agent": "Mozilla/4.0 (compatible; MSIE 6.0; MS Web Services Client Protocol 2.0.50727.5420)",
+    }
+
+    try:
+        resp = req.post(_MS_ENDPOINT, data=soap.encode("utf-8"), headers=headers, timeout=30)
+        if resp.status_code != 200:
+            log.warning(f"  Microsoft API HTTP {resp.status_code}")
+            return ""
+
+        # Витягуємо ResponseXml з SOAP відповіді
+        root = ET.fromstring(resp.text)
+        ns_soap = "http://schemas.xmlsoap.org/soap/envelope/"
+        ns_batch = "http://www.microsoft.com/BatchActivationService"
+        body = root.find(f"{{{ns_soap}}}Body")
+        if body is None:
+            return ""
+        result = body.find(f".//{{{ns_batch}}}ResponseXml")
+        if result is None:
+            # Спробуємо без namespace
+            result = body.find(".//{*}ResponseXml")
+        if result is None or not result.text:
+            return ""
+
+        inner = ET.fromstring(result.text)
+        cid_node = inner.find(".//{*}CID")
+        err_node = inner.find(".//{*}ErrorCode")
+
+        if cid_node is not None and cid_node.text:
+            log.info(f"  Microsoft API: CID отримано успішно")
+            return cid_node.text.strip()
+        if err_node is not None:
+            err = err_node.text.strip() if err_node.text else "unknown"
+            _MS_ERROR_MAP = {
+                "0x67": "Ключ заблоковано", "0x68": "Невалідний ключ",
+                "0x71": "Ліміт активацій вичерпано", "0x7F": "MAK ліміт вичерпано",
+                "0x86": "Тип ключа не підтримується", "0x90": "Невалідний IID",
+                "0x8D": "Невалідний IID", "0xD5": "ROT ліміт вичерпано",
+                "0x80131600": "Помилка сервера або невалідний AdvancedPid",
+            }
+            msg = _MS_ERROR_MAP.get(err, f"Помилка {err}")
+            log.warning(f"  Microsoft API помилка: {msg}")
+            return f"MS_ERROR:{err}"
+        return ""
+    except Exception as e:
+        log.warning(f"  Microsoft API виняток: {e}")
+        return ""
+
+
 # ── Getsid API ────────────────────────────────────────────────────────────────
 def _load_getcid_counts() -> dict:
     """Завантажує лічильники використань токенів."""
@@ -409,10 +506,26 @@ def _increment_getcid_count(token: str, token_idx: int):
     log.info(f"  Getsid токен {token_idx} використано разів: {used}")
 
 def get_confirmation(activation_code: str) -> str:
-    """Відправляє код в Getsid. Якщо перший токен вичерпано — автоматично пробує другий."""
+    """Спочатку пробує Microsoft BatchActivation API (безкоштовно, без лімітів).
+    Якщо не вдалось — фолбек на Getsid (getcid.info)."""
+    iid = activation_code.replace(" ", "")
+
+    # 1. Спроба: Microsoft BatchActivation SOAP API
+    log.info("  Пробую Microsoft BatchActivation API...")
+    ms_result = get_cid_from_microsoft(iid)
+    if ms_result and not ms_result.startswith("MS_ERROR:"):
+        return ms_result
+    if ms_result.startswith("MS_ERROR:"):
+        log.warning(f"  Microsoft API відхилив IID/ключ ({ms_result}) — пробую Getsid як фолбек")
+        # Для деяких помилок немає сенсу пробувати getcid.info
+        if ms_result in ("MS_ERROR:0x67", "MS_ERROR:0x68", "MS_ERROR:0x71",
+                         "MS_ERROR:0x7F", "MS_ERROR:0x86", "MS_ERROR:0xD5"):
+            return ms_result
+
+    # 2. Фолбек: Getsid (getcid.info)
     if not GETCID_TOKEN:
         return ""
-    iid = activation_code.replace(" ", "")
+    log.info("  Фолбек на Getsid API...")
     tokens = [t for t in [GETCID_TOKEN, GETCID_TOKEN_2] if t]
     for i, token in enumerate(tokens, 1):
         try:
@@ -425,7 +538,7 @@ def get_confirmation(activation_code: str) -> str:
             }
             resp = req.get(url, headers=headers, timeout=30)
             result = resp.text.strip()
-            # Cloudflare challenge — логуємо скорочено
+            # Cloudflare challenge
             if result.startswith("<!") or "Just a moment" in result or "challenge" in result.lower():
                 log.warning(f"  Getsid токен {i}: Cloudflare блокує запит з Railway IP")
                 return ""
@@ -441,7 +554,6 @@ def get_confirmation(activation_code: str) -> str:
                 except Exception:
                     pass
                 continue
-            # Успішна відповідь — рахуємо використання
             if not any(err in result for err in ["Wrong", "Blocked", "Exceeded", "limit", "empty", "error", "Token"]):
                 _increment_getcid_count(token, i)
             return result
@@ -473,8 +585,17 @@ def notify(sender_email: str, subject: str, codes: list, msg_id: str = "", body_
 
         # Отримуємо підтвердження з Getsid
         confirmation = get_confirmation(code)
-        if confirmation and not any(err in confirmation for err in ["Wrong", "Blocked", "Exceeded", "limit", "empty", "error"]):
+        if confirmation and not any(err in confirmation for err in ["Wrong", "Blocked", "Exceeded", "limit", "empty", "error", "MS_ERROR"]):
             confirm_section = f"\n✅ *Код підтвердження{num}:*\n`{format_confirmation(confirmation)}`"
+        elif confirmation and confirmation.startswith("MS_ERROR:"):
+            err_code = confirmation.split(":")[1]
+            _MS_ERR_LABELS = {
+                "0x67": "Ключ заблоковано Microsoft", "0x68": "Невалідний ключ",
+                "0x71": "Ліміт активацій вичерпано", "0x7F": "MAK ліміт вичерпано",
+                "0x86": "Тип ключа не підтримується", "0x90": "Невалідний IID",
+                "0x8D": "Невалідний IID", "0xD5": "ROT ліміт вичерпано",
+            }
+            confirm_section = f"\n⚠️ *MS Activation:* {_MS_ERR_LABELS.get(err_code, err_code)}"
         elif confirmation:
             confirm_section = f"\n⚠️ *Getsid:* {confirmation}"
         else:
