@@ -25,7 +25,8 @@ CREDENTIALS_FILE  = os.path.join(DATA_DIR, "credentials.json")
 TOKEN_FILE        = os.path.join(DATA_DIR, "gmail_token.json")
 PROCESSED_FILE    = os.path.join(DATA_DIR, "processed_ids.json")
 LAST_CHECK_FILE   = os.path.join(DATA_DIR, "last_check_time.txt")
-GETCID_COUNT_FILE = os.path.join(DATA_DIR, "getcid_token_count.json")
+GETCID_COUNT_FILE  = os.path.join(DATA_DIR, "getcid_token_count.json")
+PENDING_FILE       = os.path.join(DATA_DIR, "pending_activations.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -576,6 +577,28 @@ def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     req.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=20)
 
+def _load_pending() -> list:
+    try:
+        if os.path.exists(PENDING_FILE):
+            with open(PENDING_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+def _save_pending(pending: list):
+    try:
+        with open(PENDING_FILE, "w") as f:
+            json.dump(pending, f)
+    except Exception:
+        pass
+
+def _is_fatal_error(confirmation: str) -> bool:
+    """Помилки, при яких retry безглуздий (ключ заблоковано/вичерпано)."""
+    return confirmation.startswith("MS_ERROR:") and any(
+        e in confirmation for e in ["0x67","0x68","0x71","0x7F","0x86","0xD5"]
+    )
+
 def notify(sender_email: str, subject: str, codes: list, msg_id: str = "", body_text: str = ""):
     """Надсилає всі знайдені коди — кожен окремим повідомленням."""
     gmail_url = f"https://mail.google.com/mail/u/0/#inbox/{msg_id}" if msg_id else ""
@@ -583,7 +606,6 @@ def notify(sender_email: str, subject: str, codes: list, msg_id: str = "", body_
     for i, code in enumerate(codes, 1):
         num = f" #{i}" if len(codes) > 1 else ""
 
-        # Отримуємо підтвердження з Getsid
         confirmation = get_confirmation(code)
         if confirmation and not any(err in confirmation for err in ["Wrong", "Blocked", "Exceeded", "limit", "empty", "error", "MS_ERROR"]):
             confirm_section = f"\n✅ *Код підтвердження{num}:*\n`{format_confirmation(confirmation)}`"
@@ -600,6 +622,14 @@ def notify(sender_email: str, subject: str, codes: list, msg_id: str = "", body_
             confirm_section = f"\n⚠️ *Getsid:* {confirmation}"
         else:
             confirm_section = ""
+            # CID не отримано — зберігаємо для повторної спроби
+            if not _is_fatal_error(confirmation):
+                pending = _load_pending()
+                entry = {"sender": sender_email, "code": code, "num": num, "email_link": email_link, "added": int(time.time())}
+                if not any(p["code"] == code for p in pending):
+                    pending.append(entry)
+                    _save_pending(pending)
+                    log.warning(f"  ⏳ CID не отримано — збережено для retry: {code[:20]}...")
 
         msg = (
             f"📧 *Від:* {email_link}\n"
@@ -608,6 +638,36 @@ def notify(sender_email: str, subject: str, codes: list, msg_id: str = "", body_
         )
         send_telegram(msg)
         log.info(f"✅ Відправлено код{num}: {code}")
+
+
+def retry_pending():
+    """Повторює спроби отримати CID для раніше невдалих активацій."""
+    pending = _load_pending()
+    if not pending:
+        return
+    log.info(f"🔄 Retry: {len(pending)} невдалих активацій...")
+    still_pending = []
+    for entry in pending:
+        # Не retry старіших за 24 год
+        if int(time.time()) - entry.get("added", 0) > 86400:
+            log.info(f"  ⏩ Пропускаємо застарілий retry: {entry['code'][:20]}...")
+            continue
+        confirmation = get_confirmation(entry["code"])
+        if confirmation and not any(err in confirmation for err in ["Wrong", "Blocked", "Exceeded", "limit", "empty", "error", "MS_ERROR"]):
+            num = entry.get("num", "")
+            msg = (
+                f"📧 *Від:* {entry['email_link']}\n"
+                f"🔑 *Код активації{num}:*\n`{entry['code']}`\n"
+                f"✅ *Код підтвердження{num}:*\n`{format_confirmation(confirmation)}`"
+            )
+            send_telegram(msg)
+            log.info(f"  ✅ Retry успішний: {entry['code'][:20]}...")
+        elif _is_fatal_error(confirmation):
+            log.warning(f"  ❌ Retry: фатальна помилка {confirmation}, видаляємо")
+        else:
+            still_pending.append(entry)
+            log.warning(f"  ⏳ Retry: ще не вдалось, залишаємо в черзі")
+    _save_pending(still_pending)
 
 
 # ── Одна перевірка ────────────────────────────────────────────────────────────
@@ -687,12 +747,19 @@ def main():
 
     last_error_notify = 0  # час останнього Telegram-повідомлення про помилку
     ERROR_NOTIFY_INTERVAL = 1800  # не спамити частіше ніж раз на 30 хвилин
+    last_retry = 0
+    RETRY_INTERVAL = 120  # retry невдалих активацій кожні 2 хвилини
 
     while True:
         try:
             log.info("🔄 Перевіряю листи...")
             processed = check_once(service, processed)
             last_error_notify = 0  # скидаємо лічильник якщо все ок
+
+            # Retry невдалих активацій
+            if time.time() - last_retry > RETRY_INTERVAL:
+                retry_pending()
+                last_retry = time.time()
         except Exception as e:
             log.error(f"Помилка: {e}")
 
