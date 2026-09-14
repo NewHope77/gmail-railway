@@ -107,6 +107,7 @@ def find_activation_code(text: str):
 VISION_API_KEY  = os.environ.get("GOOGLE_VISION_API_KEY", "")
 GETCID_TOKEN    = os.environ.get("GETCID_TOKEN", "")
 GETCID_TOKEN_2  = os.environ.get("GETCID_TOKEN_2", "")
+GETCID_PROXY    = os.environ.get("GETCID_PROXY", "https://getcid.info")  # Cloudflare Worker proxy
 
 def ocr_via_google_vision(image_path: str) -> str:
     """OCR через Google Cloud Vision API — найточніший варіант."""
@@ -530,7 +531,7 @@ def get_confirmation(activation_code: str) -> str:
     tokens = [t for t in [GETCID_TOKEN, GETCID_TOKEN_2] if t]
     for i, token in enumerate(tokens, 1):
         try:
-            url = f"https://getcid.info/api/{iid}/{token}"
+            url = f"{GETCID_PROXY}/api/{iid}/{token}"
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
