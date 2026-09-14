@@ -520,8 +520,9 @@ def get_confirmation(activation_code: str) -> str:
     if ms_result.startswith("MS_ERROR:"):
         log.warning(f"  Microsoft API відхилив IID/ключ ({ms_result}) — пробую Getsid як фолбек")
         # Для деяких помилок немає сенсу пробувати getcid.info
-        if ms_result in ("MS_ERROR:0x67", "MS_ERROR:0x68", "MS_ERROR:0x71",
-                         "MS_ERROR:0x7F", "MS_ERROR:0x86", "MS_ERROR:0xD5"):
+        # Зупиняємось тільки якщо ключ заблоковано/невалідний — getcid теж не допоможе
+        # 0x71/0x7F/0xD5 (ліміти) — getcid використовує інший метод, може спрацювати
+        if ms_result in ("MS_ERROR:0x67", "MS_ERROR:0x68"):
             return ms_result
 
     # 2. Фолбек: Getsid (getcid.info)
