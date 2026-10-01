@@ -221,69 +221,13 @@ def ocr_via_tesseract(image_path: str) -> str:
         log.warning(f"Tesseract OCR помилка: {e}")
         return ""
 
-def ocr_via_claude(image_path: str) -> str:
-    """OCR через Claude Vision API — найкращий для нечітких/темних фото."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return ""
-    try:
-        with open(image_path, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode()
-        ext = image_path.rsplit(".", 1)[-1].lower()
-        media_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                      "bmp": "image/bmp", "webp": "image/webp", "tiff": "image/tiff"}.get(ext, "image/png")
-        payload = {
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 120,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
-                    {"type": "text", "text": (
-                        "This is a Microsoft Office or Windows activation wizard screenshot. "
-                        "Find the Installation ID — 9 groups of 7 digits (63 digits total). "
-                        "Return ONLY the digits separated by spaces in groups of 7, like: "
-                        "1234567 1234567 1234567 1234567 1234567 1234567 1234567 1234567 1234567. "
-                        "Nothing else. If not found, return empty."
-                    )}
-                ]
-            }]
-        }
-        resp = req.post(
-            "https://api.anthropic.com/v1/messages",
-            json=payload,
-            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            timeout=30
-        )
-        if resp.status_code == 200:
-            text = resp.json()["content"][0]["text"].strip()
-            log.info(f"  OCR: Claude Vision відповідь отримано")
-            return text
-    except Exception as e:
-        log.warning(f"  Claude Vision OCR помилка: {e}")
-    return ""
-
 def ocr_image(image_path: str) -> str:
-    """1. Google Vision API → 2. Claude Vision → 3. pytesseract."""
-    # 1. Google Vision API
+    """Спочатку Google Vision API, при невдачі — pytesseract."""
     text = ocr_via_google_vision(image_path)
-    if text and find_activation_code(text):
+    if text:
         return text
-
-    # 2. Claude Vision (краще читає нечіткі/темні/повернуті фото)
-    claude_text = ocr_via_claude(image_path)
-    if claude_text and find_activation_code(claude_text):
-        log.info("  OCR: Claude Vision знайшов код")
-        return claude_text
-
-    # 3. pytesseract (останній варіант)
     log.info("  OCR: fallback на pytesseract")
-    tess = ocr_via_tesseract(image_path)
-    if tess and find_activation_code(tess):
-        return tess
-
-    # повертаємо найкращий непустий результат
-    return text or claude_text or tess or ""
+    return ocr_via_tesseract(image_path)
 
 
 # ── Декодування тіла листа ────────────────────────────────────────────────────
