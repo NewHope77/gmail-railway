@@ -28,6 +28,7 @@ LAST_CHECK_FILE   = os.path.join(DATA_DIR, "last_check_time.txt")
 GETCID_COUNT_FILE       = os.path.join(DATA_DIR, "getcid_token_count.json")
 PENDING_FILE            = os.path.join(DATA_DIR, "pending_activations.json")
 PROCESSED_THREADS_FILE  = os.path.join(DATA_DIR, "processed_threads.json")
+PROCESSED_CODES_FILE    = os.path.join(DATA_DIR, "processed_codes.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -98,6 +99,19 @@ def load_processed_threads() -> set:
 def save_processed_threads(threads: set):
     with open(PROCESSED_THREADS_FILE, "w") as f:
         json.dump(list(threads), f)
+
+def load_processed_codes() -> set:
+    if os.path.exists(PROCESSED_CODES_FILE):
+        try:
+            with open(PROCESSED_CODES_FILE) as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+def save_processed_codes(codes: set):
+    with open(PROCESSED_CODES_FILE, "w") as f:
+        json.dump(list(codes), f)
 
 
 # ── Пошук 63-значного коду ────────────────────────────────────────────────────
@@ -652,13 +666,24 @@ def notify(sender_email: str, subject: str, codes: list, msg_id: str = "", body_
     """Надсилає всі знайдені коди — кожен окремим повідомленням."""
     gmail_url = f"https://mail.google.com/mail/u/0/#inbox/{msg_id}" if msg_id else ""
     email_link = f"[{sender_email}]({gmail_url})" if gmail_url else f"`{sender_email}`"
+    processed_codes = load_processed_codes()
+    codes_updated = False
     for i, code in enumerate(codes, 1):
         num = f" #{i}" if len(codes) > 1 else ""
+
+        # Пропускаємо якщо цей IID вже успішно оброблено раніше
+        clean_code = re.sub(r"\s", "", code)
+        if clean_code in processed_codes:
+            log.info(f"  ↳ Код{num} вже оброблено раніше — пропускаємо")
+            continue
 
         confirmation = get_confirmation(code)
         if confirmation and not any(err in confirmation for err in ["Wrong", "Blocked", "Exceeded", "limit", "empty", "error", "MS_ERROR"]):
             cid_fmt = format_confirmation(confirmation)
             confirm_section = f"\n✅ *Код підтвердження{num}:*\n`{cid_fmt}`"
+            # Зберігаємо код як успішно оброблений
+            processed_codes.add(clean_code)
+            codes_updated = True
             # Автовідповідь клієнту
             send_reply_email(sender_email, thread_id, message_id_header, cid_fmt)
         elif confirmation and confirmation.startswith("MS_ERROR:"):
@@ -695,6 +720,8 @@ def notify(sender_email: str, subject: str, codes: list, msg_id: str = "", body_
         )
         send_telegram(msg)
         log.info(f"✅ Відправлено код{num}: {code}")
+    if codes_updated:
+        save_processed_codes(processed_codes)
 
 
 def retry_pending():
@@ -726,6 +753,10 @@ def retry_pending():
                 entry.get("message_id_header", ""),
                 cid_fmt,
             )
+            # Позначаємо код як успішно оброблений
+            processed_codes = load_processed_codes()
+            processed_codes.add(re.sub(r"\s", "", entry["code"]))
+            save_processed_codes(processed_codes)
             log.info(f"  ✅ Retry успішний: {entry['code'][:20]}...")
         elif _is_fatal_error(confirmation):
             log.warning(f"  ❌ Retry: фатальна помилка {confirmation}, видаляємо")
@@ -764,9 +795,6 @@ def check_once(service, processed: set) -> set:
 
     log.info(f"📬 Нових листів: {len(new_messages)}")
 
-    processed_threads = load_processed_threads()
-    threads_updated = False
-
     for msg_ref in new_messages:
         msg_id = msg_ref["id"]
         msg = service.users().messages().get(
@@ -781,14 +809,9 @@ def check_once(service, processed: set) -> set:
         m                 = re.search(r'<([^>]+)>', sender)
         sender_email      = m.group(1) if m else sender
 
-        processed.add(msg_id)
-
-        # Якщо тред вже оброблено (відповідь "дякую" тощо) — пропускаємо
-        if thread_id and thread_id in processed_threads:
-            log.info(f"→ {sender_email} | {subject} — тред вже оброблено, пропускаємо")
-            continue
-
         log.info(f"→ {sender_email} | {subject}")
+
+        processed.add(msg_id)
 
         # Отримуємо текст листа для відображення
         body_text = get_plain_body(msg["payload"])
@@ -807,16 +830,10 @@ def check_once(service, processed: set) -> set:
             log.info(f"  ↳ Знайдено кодів: {len(codes)}")
             notify(sender_email, subject, codes, msg_id, body_text,
                    thread_id=thread_id, message_id_header=message_id_header)
-            # Позначаємо тред як оброблений
-            if thread_id:
-                processed_threads.add(thread_id)
-                threads_updated = True
         else:
             log.info(f"  ↳ Код не знайдено — ігнорується")
 
     save_processed(processed)
-    if threads_updated:
-        save_processed_threads(processed_threads)
     return processed
 
 
