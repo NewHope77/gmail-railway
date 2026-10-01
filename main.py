@@ -610,11 +610,18 @@ def send_reply_email(to_email: str, thread_id: str, message_id_header: str, cid_
         return
     try:
         import email.mime.text
-        cid_lines = "\n".join(cid_formatted.split())
+        groups = cid_formatted.split()
+        col = "   "
+        cid_block = (
+            f"A{col}B{col}C{col}D{col}E\n"
+            f"{groups[0]}{col}{groups[1]}{col}{groups[2]}{col}{groups[3]}{col}{groups[4]}\n\n"
+            f"F{col}G{col}H\n"
+            f"{groups[5]}{col}{groups[6]}{col}{groups[7]}"
+        ) if len(groups) == 8 else cid_formatted
         body = (
             f"Дякуємо за покупку!\n\n"
-            f"Ваш код підтвердження активації (крок 3):\n\n"
-            f"{cid_lines}\n\n"
+            f"Ваш ідентифікатор підтвердження (крок 3):\n\n"
+            f"{cid_block}\n\n"
             f"Введіть кожну групу цифр у відповідну колонку вікна активації Office.\n\n"
             f"З повагою,\nKluczi.com.ua"
         )
