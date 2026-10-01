@@ -611,11 +611,11 @@ def send_reply_email(to_email: str, thread_id: str, message_id_header: str, cid_
     try:
         import email.mime.text
         body = (
-            f"Dziękujemy za zakup!\n\n"
-            f"Twój kod potwierdzenia aktywacji:\n\n"
+            f"Дякуємо за покупку!\n\n"
+            f"Ваш код підтвердження активації:\n\n"
             f"{cid_formatted}\n\n"
-            f"Wpisz powyższy kod w okno aktywacji systemu Windows lub pakietu Office.\n\n"
-            f"Pozdrawiamy,\nKluczi.com.ua"
+            f"Введіть цей код у вікно активації Windows або Office.\n\n"
+            f"З повагою,\nKluczi.com.ua"
         )
         msg = email.mime.text.MIMEText(body, "plain", "utf-8")
         msg["To"] = to_email
