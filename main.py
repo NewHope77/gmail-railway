@@ -610,11 +610,12 @@ def send_reply_email(to_email: str, thread_id: str, message_id_header: str, cid_
         return
     try:
         import email.mime.text
+        cid_lines = "\n".join(cid_formatted.split())
         body = (
             f"Дякуємо за покупку!\n\n"
-            f"Ваш код підтвердження активації:\n\n"
-            f"{cid_formatted}\n\n"
-            f"Введіть цей код у вікно активації Windows або Office.\n\n"
+            f"Ваш код підтвердження активації (крок 3):\n\n"
+            f"{cid_lines}\n\n"
+            f"Введіть кожну групу цифр у відповідну колонку вікна активації Windows або Office.\n\n"
             f"З повагою,\nKluczi.com.ua"
         )
         msg = email.mime.text.MIMEText(body, "plain", "utf-8")
