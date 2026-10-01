@@ -25,8 +25,9 @@ CREDENTIALS_FILE  = os.path.join(DATA_DIR, "credentials.json")
 TOKEN_FILE        = os.path.join(DATA_DIR, "gmail_token.json")
 PROCESSED_FILE    = os.path.join(DATA_DIR, "processed_ids.json")
 LAST_CHECK_FILE   = os.path.join(DATA_DIR, "last_check_time.txt")
-GETCID_COUNT_FILE  = os.path.join(DATA_DIR, "getcid_token_count.json")
-PENDING_FILE       = os.path.join(DATA_DIR, "pending_activations.json")
+GETCID_COUNT_FILE       = os.path.join(DATA_DIR, "getcid_token_count.json")
+PENDING_FILE            = os.path.join(DATA_DIR, "pending_activations.json")
+PROCESSED_THREADS_FILE  = os.path.join(DATA_DIR, "processed_threads.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -55,7 +56,12 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+_gmail_service = None  # встановлюється в main()
+
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 
 def get_gmail_service():
     creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
@@ -79,6 +85,19 @@ def load_processed():
 def save_processed(ids: set):
     with open(PROCESSED_FILE, "w") as f:
         json.dump(list(ids), f)
+
+def load_processed_threads() -> set:
+    if os.path.exists(PROCESSED_THREADS_FILE):
+        try:
+            with open(PROCESSED_THREADS_FILE) as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+def save_processed_threads(threads: set):
+    with open(PROCESSED_THREADS_FILE, "w") as f:
+        json.dump(list(threads), f)
 
 
 # ── Пошук 63-значного коду ────────────────────────────────────────────────────
@@ -571,6 +590,33 @@ def format_confirmation(code: str) -> str:
         return " ".join(digits[i:i+6] for i in range(0, 48, 6))
     return code  # повертаємо як є якщо кількість цифр не 48
 
+def send_reply_email(to_email: str, thread_id: str, message_id_header: str, cid_formatted: str):
+    """Відправляє автовідповідь клієнту з кодом підтвердження активації."""
+    if not _gmail_service or not thread_id:
+        return
+    try:
+        import email.mime.text
+        body = (
+            f"Dziękujemy za zakup!\n\n"
+            f"Twój kod potwierdzenia aktywacji:\n\n"
+            f"{cid_formatted}\n\n"
+            f"Wpisz powyższy kod w okno aktywacji systemu Windows lub pakietu Office.\n\n"
+            f"Pozdrawiamy,\nKluczi.com.ua"
+        )
+        msg = email.mime.text.MIMEText(body, "plain", "utf-8")
+        msg["To"] = to_email
+        if message_id_header:
+            msg["In-Reply-To"] = message_id_header
+            msg["References"]  = message_id_header
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        _gmail_service.users().messages().send(
+            userId="me",
+            body={"raw": raw, "threadId": thread_id}
+        ).execute()
+        log.info(f"  📧 Автовідповідь відправлена на {to_email}")
+    except Exception as e:
+        log.warning(f"  ❌ Автовідповідь не вдалась: {e}")
+
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
 import requests as req
@@ -601,7 +647,8 @@ def _is_fatal_error(confirmation: str) -> bool:
         e in confirmation for e in ["0x67","0x68","0x71","0x7F","0x86","0xD5"]
     )
 
-def notify(sender_email: str, subject: str, codes: list, msg_id: str = "", body_text: str = ""):
+def notify(sender_email: str, subject: str, codes: list, msg_id: str = "", body_text: str = "",
+           thread_id: str = "", message_id_header: str = ""):
     """Надсилає всі знайдені коди — кожен окремим повідомленням."""
     gmail_url = f"https://mail.google.com/mail/u/0/#inbox/{msg_id}" if msg_id else ""
     email_link = f"[{sender_email}]({gmail_url})" if gmail_url else f"`{sender_email}`"
@@ -610,7 +657,10 @@ def notify(sender_email: str, subject: str, codes: list, msg_id: str = "", body_
 
         confirmation = get_confirmation(code)
         if confirmation and not any(err in confirmation for err in ["Wrong", "Blocked", "Exceeded", "limit", "empty", "error", "MS_ERROR"]):
-            confirm_section = f"\n✅ *Код підтвердження{num}:*\n`{format_confirmation(confirmation)}`"
+            cid_fmt = format_confirmation(confirmation)
+            confirm_section = f"\n✅ *Код підтвердження{num}:*\n`{cid_fmt}`"
+            # Автовідповідь клієнту
+            send_reply_email(sender_email, thread_id, message_id_header, cid_fmt)
         elif confirmation and confirmation.startswith("MS_ERROR:"):
             err_code = confirmation.split(":")[1]
             _MS_ERR_LABELS = {
@@ -627,7 +677,12 @@ def notify(sender_email: str, subject: str, codes: list, msg_id: str = "", body_
             # CID не отримано — зберігаємо для повторної спроби
             if not _is_fatal_error(confirmation):
                 pending = _load_pending()
-                entry = {"sender": sender_email, "code": code, "num": num, "email_link": email_link, "added": int(time.time())}
+                entry = {
+                    "sender": sender_email, "code": code, "num": num,
+                    "email_link": email_link, "added": int(time.time()),
+                    "to_email": sender_email, "thread_id": thread_id,
+                    "message_id_header": message_id_header,
+                }
                 if not any(p["code"] == code for p in pending):
                     pending.append(entry)
                     _save_pending(pending)
@@ -657,12 +712,20 @@ def retry_pending():
         confirmation = get_confirmation(entry["code"])
         if confirmation and not any(err in confirmation for err in ["Wrong", "Blocked", "Exceeded", "limit", "empty", "error", "MS_ERROR"]):
             num = entry.get("num", "")
+            cid_fmt = format_confirmation(confirmation)
             msg = (
                 f"📧 *Від:* {entry['email_link']}\n"
                 f"🔑 *Код активації{num}:*\n`{entry['code']}`\n"
-                f"✅ *Код підтвердження{num}:*\n`{format_confirmation(confirmation)}`"
+                f"✅ *Код підтвердження{num}:*\n`{cid_fmt}`"
             )
             send_telegram(msg)
+            # Автовідповідь клієнту при успішному retry
+            send_reply_email(
+                entry.get("to_email", ""),
+                entry.get("thread_id", ""),
+                entry.get("message_id_header", ""),
+                cid_fmt,
+            )
             log.info(f"  ✅ Retry успішний: {entry['code'][:20]}...")
         elif _is_fatal_error(confirmation):
             log.warning(f"  ❌ Retry: фатальна помилка {confirmation}, видаляємо")
@@ -701,16 +764,29 @@ def check_once(service, processed: set) -> set:
 
     log.info(f"📬 Нових листів: {len(new_messages)}")
 
+    processed_threads = load_processed_threads()
+    threads_updated = False
+
     for msg_ref in new_messages:
         msg_id = msg_ref["id"]
         msg = service.users().messages().get(
             userId="me", id=msg_id, format="full").execute()
 
-        headers      = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
-        sender       = headers.get("From", "невідомо")
-        subject      = headers.get("Subject", "")
-        m            = re.search(r'<([^>]+)>', sender)
-        sender_email = m.group(1) if m else sender
+        thread_id = msg.get("threadId", "")
+
+        headers           = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+        sender            = headers.get("From", "невідомо")
+        subject           = headers.get("Subject", "")
+        message_id_header = headers.get("Message-ID", "")
+        m                 = re.search(r'<([^>]+)>', sender)
+        sender_email      = m.group(1) if m else sender
+
+        processed.add(msg_id)
+
+        # Якщо тред вже оброблено (відповідь "дякую" тощо) — пропускаємо
+        if thread_id and thread_id in processed_threads:
+            log.info(f"→ {sender_email} | {subject} — тред вже оброблено, пропускаємо")
+            continue
 
         log.info(f"→ {sender_email} | {subject}")
 
@@ -727,23 +803,30 @@ def check_once(service, processed: set) -> set:
             if code not in codes:
                 codes.append(code)
 
-        processed.add(msg_id)
-
         if codes:
             log.info(f"  ↳ Знайдено кодів: {len(codes)}")
-            notify(sender_email, subject, codes, msg_id, body_text)
+            notify(sender_email, subject, codes, msg_id, body_text,
+                   thread_id=thread_id, message_id_header=message_id_header)
+            # Позначаємо тред як оброблений
+            if thread_id:
+                processed_threads.add(thread_id)
+                threads_updated = True
         else:
             log.info(f"  ↳ Код не знайдено — ігнорується")
 
     save_processed(processed)
+    if threads_updated:
+        save_processed_threads(processed_threads)
     return processed
 
 
 # ── Головний цикл ─────────────────────────────────────────────────────────────
 def main():
+    global _gmail_service
     log.info("🚀 Gmail Monitor запущено на Railway")
-    service   = get_gmail_service()
-    processed = load_processed()
+    service          = get_gmail_service()
+    _gmail_service   = service
+    processed        = load_processed()
 
     send_telegram("🚀 Gmail моніторинг запущено! Чекаю нових листів з кодами активації.")
 
@@ -777,6 +860,7 @@ def main():
             # Спроба перепідключитись до Gmail
             try:
                 service = get_gmail_service()
+                _gmail_service = service
                 log.info("✅ Перепідключення до Gmail успішне")
             except Exception as e2:
                 log.error(f"Перепідключення не вдалось: {e2}")
