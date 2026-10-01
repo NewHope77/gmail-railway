@@ -611,21 +611,29 @@ def send_reply_email(to_email: str, thread_id: str, message_id_header: str, cid_
     try:
         import email.mime.text
         groups = cid_formatted.split()
-        col = "   "
-        cid_block = (
-            f"A{col}B{col}C{col}D{col}E\n"
-            f"{groups[0]}{col}{groups[1]}{col}{groups[2]}{col}{groups[3]}{col}{groups[4]}\n\n"
-            f"F{col}G{col}H\n"
-            f"{groups[5]}{col}{groups[6]}{col}{groups[7]}"
-        ) if len(groups) == 8 else cid_formatted
-        body = (
-            f"Дякуємо за покупку!\n\n"
-            f"Ваш ідентифікатор підтвердження (крок 3):\n\n"
-            f"{cid_block}\n\n"
-            f"Введіть кожну групу цифр у відповідну колонку вікна активації Office.\n\n"
-            f"З повагою,\nKluczi.com.ua"
-        )
-        msg = email.mime.text.MIMEText(body, "plain", "utf-8")
+        if len(groups) == 8:
+            letters = list("ABCDEFGH")
+            cell_style = 'style="font-family:monospace;font-size:16px;padding:4px 12px;text-align:center;border:1px solid #ddd;"'
+            def row(items):
+                return "<tr>" + "".join(f"<td {cell_style}>{x}</td>" for x in items) + "</tr>"
+            table = (
+                f'<table style="border-collapse:collapse;margin:8px 0;">'
+                f'{row(letters[:5])}{row(groups[:5])}'
+                f'{row(letters[5:])}{row(groups[5:])}'
+                f'</table>'
+            )
+        else:
+            table = f"<pre>{cid_formatted}</pre>"
+        import email.mime.multipart
+        html_body = f"""<html><body style="font-family:sans-serif;font-size:15px;">
+<p>Дякуємо за покупку!</p>
+<p><b>Ваш ідентифікатор підтвердження (крок 3):</b></p>
+{table}
+<p>Введіть кожну групу цифр у відповідну колонку вікна активації Office.</p>
+<p>З повагою,<br>Kluczi.com.ua</p>
+</body></html>"""
+        msg = email.mime.multipart.MIMEMultipart("alternative")
+        msg.attach(email.mime.text.MIMEText(html_body, "html", "utf-8"))
         msg["To"] = to_email
         if message_id_header:
             msg["In-Reply-To"] = message_id_header
